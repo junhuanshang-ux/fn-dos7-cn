@@ -57,16 +57,6 @@ jobs:
       - name: 生成 iOS 工程
         run: pnpm tauri ios init --ci
 
-      - name: 安装 CocoaPods 依赖（若工程使用 Podfile）
-        run: |
-          PODFILE=$(find src-tauri/gen/apple -maxdepth 3 -name Podfile | head -n 1)
-          if [ -n "$PODFILE" ]; then
-            cd "$(dirname "$PODFILE")"
-            pod install
-          else
-            echo "工程未使用 Podfile，跳过"
-          fi
-
       - name: 写入真实应用名（支持中文）
         run: node scripts/apply-app-name.mjs
 
