@@ -1,8 +1,8 @@
 # 桌面端云端打包：Windows / macOS / Linux
 #
 # 触发方式：
-#   1. 手动触发（Actions 页面 → Run workflow）
-#   2. 推送 v* 标签，例如  git tag v0.1.0 && git push origin v0.1.0
+#   1. 手动触发（Actions 页面 → Run workflow），可指定要产出的安装包格式
+#   2. 推送 v* 标签，例如  git tag v0.1.0 && git push origin v0.1.0（产出全部格式）
 #
 # 产物会自动发布到本仓库的 Release 页面。
 # 注意：macOS 产物未签名，首次打开需要执行
@@ -12,6 +12,12 @@ name: 打包桌面版
 
 on:
   workflow_dispatch:
+    inputs:
+      bundles:
+        description: '要产出的安装包格式，逗号分隔（可选 msi,nsis,dmg,deb,rpm,appimage）'
+        required: false
+        default: 'msi,nsis,dmg,deb,rpm,appimage'
+        type: string
   push:
     tags:
       - 'v*'
@@ -36,34 +42,76 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    env:
+      # 手动触发时用传入的格式选择；tag 触发时 inputs 为空，回退到全部格式
+      BUNDLES: ${{ inputs.bundles || 'msi,nsis,dmg,deb,rpm,appimage' }}
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      # 每个平台支持的格式是固定的：Windows → msi/nsis，macOS → dmg，Linux → deb/rpm/appimage。
+      # 这里把所选格式与本平台求交集；结果为空说明这个平台不需要构建，
+      # 后续所有步骤都会被跳过，真正做到「不选就不跑」而不是空跑一遍。
+      - name: 计算本平台要产出的格式
+        id: pick
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            *windows*) ALL="msi nsis" ;;
+            *apple-darwin*) ALL="dmg" ;;
+            *) ALL="deb rpm appimage" ;;
+          esac
+          SEL=",${BUNDLES},"
+          # 传入值里一个合法格式都没有，说明是手填错了（比如从 Actions 页面手动触发时写错）。
+          # 这种情况直接报错，而不是让四个 job 都静默空跑、最后显示一片绿色却没产物。
+          case "$SEL" in
+            *",msi,"*|*",nsis,"*|*",dmg,"*|*",deb,"*|*",rpm,"*|*",appimage,"*) ;;
+            *)
+              echo "::error::bundles 里没有任何合法格式: '${BUNDLES}'。可选 msi,nsis,dmg,deb,rpm,appimage"
+              exit 1
+              ;;
+          esac
+          PICK=""
+          for f in $ALL; do
+            case "$SEL" in *",$f,"*) PICK="${PICK:+$PICK,}$f" ;; esac
+          done
+          echo "list=$PICK" >> "$GITHUB_OUTPUT"
+          if [ -z "$PICK" ]; then
+            echo "本平台未选中任何格式，整个 job 跳过"
+          else
+            echo "本平台产出格式: $PICK"
+          fi
+
       - name: 安装 pnpm
+        if: steps.pick.outputs.list != ''
         uses: pnpm/action-setup@v4
         with:
           version: 10
 
       - name: 安装 Node
+        if: steps.pick.outputs.list != ''
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: pnpm
 
       - name: 安装 Rust
+        if: steps.pick.outputs.list != ''
         uses: dtolnay/rust-toolchain@stable
 
       - name: 添加编译目标
+        if: steps.pick.outputs.list != ''
         run: rustup target add ${{ matrix.target }}
 
       - name: 缓存 Rust 依赖
+        if: steps.pick.outputs.list != ''
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
 
       - name: 安装 Linux 系统依赖
-        if: matrix.os == 'ubuntu-22.04'
+        if: matrix.os == 'ubuntu-22.04' && steps.pick.outputs.list != ''
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -74,11 +122,13 @@ jobs:
             rpm
 
       - name: 安装依赖并生成图标
+        if: steps.pick.outputs.list != ''
         run: |
           pnpm install
           pnpm icon
 
       - name: 编译并发布
+        if: steps.pick.outputs.list != ''
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -88,5 +138,8 @@ jobs:
           releaseDraft: false
           prerelease: false
           # 本地默认只出 exe（bundle.active=false），这里追加配置，
-          # 让云端产出 .msi/.dmg/.deb/AppImage 等可分发安装包
-          args: --target ${{ matrix.target }} --config src-tauri/tauri.bundle.conf.json
+          # 让云端产出可分发安装包；--bundles 只保留本平台被选中的格式
+          args: >-
+            --target ${{ matrix.target }}
+            --config src-tauri/tauri.bundle.conf.json
+            --bundles ${{ steps.pick.outputs.list }}

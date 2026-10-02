@@ -1,29 +1,20 @@
-# Android 云端打包：产出可安装的 APK
+# Android 云端打包：产出可安装的 release APK
 #
 # 触发方式：
-#   1. 手动触发（Actions 页面 → Run workflow），可选 debug / release
-#   2. 推送 v* 标签（走 debug，开箱即可安装）
+#   1. 手动触发（Actions 页面 → Run workflow）
+#   2. 推送 v* 标签
 #
-# debug 构建用 Android 调试密钥自动签名，下载后可直接装到手机。
-# release 构建需要配置签名密钥，否则产物未签名、装不上：
-#   仓库 Settings → Secrets and variables → Actions 添加
-#     ANDROID_KEYSTORE_BASE64   —— keystore 文件做 base64 后的内容
-#     ANDROID_KEYSTORE_PASSWORD —— keystore 与 key 的密码
-#   keystore 的 key alias 需为 pakeplus
+# 固定走 release（体积更小、启动更快）。签名分两种情况：
+#   - 配了仓库 Secrets，就用你自己的密钥签名，可上架、可覆盖升级：
+#       ANDROID_KEYSTORE_BASE64   —— keystore 文件做 base64 后的内容
+#       ANDROID_KEYSTORE_PASSWORD —— keystore 与 key 的密码
+#     keystore 的 key alias 需为 pakeplus
+#   - 没配，就现场生成一个调试密钥来签。产物照样装得上，只是不能上架商店。
 
 name: 打包 Android
 
 on:
   workflow_dispatch:
-    inputs:
-      variant:
-        description: '构建类型（debug 可直接安装；release 需要签名密钥）'
-        required: true
-        type: choice
-        options:
-          - debug
-          - release
-        default: debug
   push:
     tags:
       - 'v*'
@@ -71,8 +62,32 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      - name: 安装 Android SDK
-        uses: android-actions/setup-android@v3
+      - name: 准备 Android SDK
+        run: |
+          # 不依赖第三方 action：ubuntu runner 自带 Android SDK，只有缺失时才自己下命令行工具。
+          # 这样不会被 android-actions/setup-android 的版本变动影响（v3 的下载地址已失效）。
+          if command -v sdkmanager > /dev/null 2>&1; then
+            echo "使用已有的 sdkmanager: $(command -v sdkmanager)"
+          else
+            SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/android-sdk}}"
+            echo "未找到 sdkmanager，下载命令行工具到 $SDK"
+            mkdir -p "$SDK/cmdline-tools"
+            curl -fsSL -o /tmp/cmdline-tools.zip \
+              "https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip"
+            unzip -q /tmp/cmdline-tools.zip -d "$SDK/cmdline-tools"
+            rm -rf "$SDK/cmdline-tools/latest"
+            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+            {
+              echo "ANDROID_SDK_ROOT=$SDK"
+              echo "ANDROID_HOME=$SDK"
+            } >> "$GITHUB_ENV"
+            {
+              echo "$SDK/cmdline-tools/latest/bin"
+              echo "$SDK/platform-tools"
+            } >> "$GITHUB_PATH"
+            export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+          fi
+          echo "sdkmanager 版本: $(sdkmanager --version)"
 
       - name: 接受 Android SDK 许可
         run: yes | sdkmanager --licenses > /dev/null || true
@@ -109,30 +124,45 @@ jobs:
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: 编译 APK
+        run: pnpm tauri android build --target aarch64 --apk
+
+      - name: 签名 APK
         run: |
-          if [ "${{ inputs.variant }}" = "release" ]; then
-            pnpm tauri android build --target aarch64 --apk
-          else
-            pnpm tauri android build --target aarch64 --debug --apk
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name 'apksigner' -type f | sort | tail -n 1)
+          ZIPALIGN=$(find "$ANDROID_HOME/build-tools" -name 'zipalign' -type f | sort | tail -n 1)
+
+          UNSIGNED=$(find src-tauri/gen/android/app/build/outputs/apk -name "*-unsigned.apk" | head -n 1)
+          if [ -z "$UNSIGNED" ]; then
+            echo "::error::没有找到未签名的 APK，编译步骤可能已经失败"
+            exit 1
           fi
 
-      - name: 用配置的密钥签名 release APK
-        if: inputs.variant == 'release' && env.KEYSTORE_BASE64 != ''
-        run: |
-          echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
-          UNSIGNED=$(find src-tauri/gen/android/app/build/outputs/apk -name "*-unsigned.apk" | head -n 1)
-          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name 'apksigner*' -type f | sort | tail -n 1)
-          "$APKSIGNER" sign \
-            --ks release.keystore --ks-key-alias pakeplus \
-            --ks-pass "pass:$KEYSTORE_PASSWORD" --key-pass "pass:$KEYSTORE_PASSWORD" \
-            --out "${UNSIGNED%-unsigned.apk}.apk" "$UNSIGNED"
-          rm -f release.keystore
-          echo "签名完成: ${UNSIGNED%-unsigned.apk}.apk"
+          # Android 11 起要求 APK 既对齐又签名，顺序不能反：先 zipalign 再 apksigner
+          ALIGNED="${UNSIGNED%-unsigned.apk}-aligned.apk"
+          "$ZIPALIGN" -f 4 "$UNSIGNED" "$ALIGNED"
 
-      - name: 未配置签名密钥时给出提示
-        if: inputs.variant == 'release' && env.KEYSTORE_BASE64 == ''
-        run: |
-          echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，产出的 release APK 未签名、无法安装。改用 debug 构建，或按文件顶部注释配置签名密钥。"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > sign.keystore
+            ALIAS=pakeplus
+            PASS="$KEYSTORE_PASSWORD"
+            echo "使用仓库 Secrets 里配置的签名密钥"
+          else
+            # 没配密钥就现场生成一个调试密钥，保证产物一定能装。
+            keytool -genkeypair -keystore sign.keystore -storepass android -alias androiddebugkey \
+              -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" > /dev/null 2>&1
+            ALIAS=androiddebugkey
+            PASS=android
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，已改用调试密钥签名。产物可以正常安装，但不能上架应用商店；且调试密钥每次构建都重新生成，无法覆盖安装旧版本。"
+          fi
+
+          OUT="${UNSIGNED%-unsigned.apk}.apk"
+          "$APKSIGNER" sign \
+            --ks sign.keystore --ks-key-alias "$ALIAS" \
+            --ks-pass "pass:$PASS" --key-pass "pass:$PASS" \
+            --out "$OUT" "$ALIGNED"
+          rm -f sign.keystore "$ALIGNED"
+          echo "签名完成: $OUT"
 
       - name: 清理未签名的中间产物
         run: |
@@ -144,7 +174,7 @@ jobs:
       - name: 上传 APK
         uses: actions/upload-artifact@v4
         with:
-          name: android-apk-${{ inputs.variant || 'debug' }}
+          name: android-apk
           path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
 
