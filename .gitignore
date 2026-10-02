@@ -1,0 +1,20 @@
+# 依赖与编译产物
+node_modules/
+src-tauri/target/
+
+# Android / iOS 工程由 `pnpm tauri android init` 生成，不纳入版本管理
+src-tauri/gen/
+
+# 各平台图标由 logo.png 生成（pnpm icon），不纳入版本管理
+src-tauri/icons/
+
+# 云端构建下载下来的产物，以及 iOS 兜底构建的中间目录
+release/
+ios-build/
+ios-payload/
+
+# 签名文件绝不能提交
+*.keystore
+*.jks
+
+.DS_Store

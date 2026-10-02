@@ -1,0 +1,112 @@
+# iOS 云端打包：产出「未签名 IPA」
+#
+# 为什么是未签名：Tauri 的 iOS 产物必须签名才能装进 iPhone，而签名需要 Apple
+# 开发者账号（$99/年）。这里用 --no-sign 产出未签名 IPA，你可以用免费 Apple ID
+# 配合 Sideloadly / AltStore 侧载安装——代价是每 7 天要重新签一次。
+#
+# 如果哪天你有了开发者账号，把下面这些配置加到仓库 Secrets 就能出已签名 IPA：
+#   APPLE_CERTIFICATE、APPLE_CERTIFICATE_PASSWORD、APPLE_SIGNING_IDENTITY
+#   APPLE_ID、APPLE_PASSWORD、APPLE_TEAM_ID
+
+name: 打包 iOS
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装依赖并生成图标
+        run: |
+          pnpm install
+          pnpm icon
+
+      - name: 生成 iOS 工程
+        run: pnpm tauri ios init --ci
+
+      - name: 写入真实应用名（支持中文）
+        run: node scripts/apply-app-name.mjs
+
+      - name: 编译未签名 IPA
+        run: |
+          if pnpm tauri ios build --no-sign; then
+            echo "tauri ios build --no-sign 构建成功"
+          else
+            echo "::warning::tauri ios build --no-sign 未成功，改用 xcodebuild 兜底构建未签名产物"
+            bash scripts/ios-unsigned-build.sh
+          fi
+
+      - name: 收集 IPA
+        id: collect
+        run: |
+          IPA=$(find . -name '*.ipa' -not -path './node_modules/*' | head -n 1)
+          if [ -z "$IPA" ]; then
+            echo "::error::没有生成任何 IPA，下面是 gen/apple 的目录结构，便于排查"
+            find src-tauri/gen/apple -maxdepth 3 -type d | head -n 40
+            exit 1
+          fi
+          APP_NAME=$(node -p "require('./package.json').name")
+          OUT="$PWD/${APP_NAME}-unsigned.ipa"
+          cp "$IPA" "$OUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+          ls -lh "$OUT"
+
+      - name: 读取版本号
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa
+          path: ${{ steps.collect.outputs.path }}
+          if-no-files-found: error
+
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-v${{ steps.version.outputs.value }}
+          name: iOS v${{ steps.version.outputs.value }}
+          body: |
+            未签名 IPA。
+
+            安装方式：用免费 Apple ID 配合 Sideloadly / AltStore 侧载到 iPhone。
+            注意免费账号签名的应用每 7 天需要重新签一次。
+          draft: false
+          files: ${{ steps.collect.outputs.path }}
+          token: ${{ secrets.GITHUB_TOKEN }}

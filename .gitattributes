@@ -1,0 +1,12 @@
+# 统一使用 LF 行尾。
+# 否则在 Windows 检出后变成 CRLF，推到 Linux / macOS 的 CI 上可能出问题。
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.icns binary
+*.ttf  binary
+*.woff binary
+*.woff2 binary
